@@ -9,6 +9,28 @@
  *
  */
 
+/*
+ * Use ethtool(8) to disable hardware defragmentation for best results.
+ *
+ * ethtool -K $IF tso off
+ * ethtool -K $IF ufo off
+ * ethtool -K $IF gso off
+ * ethtool -K $IF gro off
+ * ethtool -K $IF lro off
+ *
+ * The idea is to avoid generating new outgoing packets from reassembled
+ * incoming fragments.  In other words, if the NIC defrags two IP datagrams,
+ * and hands us one large, reassembled datagram, it may exceed MTU. That's
+ * fine unless we attempt to transmit it that way; with a raw socket that
+ * generates an error. (IP would fragment it for us, in comparison).
+ *
+ * TODO detect; query outbound MTU; warn if outbound packet exceeds it
+ * 
+ * Furthermore iptables can block any packet in/out on the rx and tx
+ * interfaces; this prevents the kernel from acting on them while still
+ * providing visibility of them to the raw socket.
+*/
+ 
 #include <errno.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
@@ -73,6 +95,7 @@ int setup_rx(void) {
 
   /* any link layer protocol packets (linux/if_ether.h) */
   int protocol = htons(ETH_P_ALL);
+  //int protocol = htons(ETH_P_8021Q); /* FIXME */
 
   /* create the packet socket */
   cfg.rx_fd = socket(AF_PACKET, SOCK_RAW, protocol);
@@ -96,6 +119,7 @@ int setup_rx(void) {
   sl.sll_family = AF_PACKET;
   sl.sll_protocol = protocol;
   sl.sll_ifindex = ifr.ifr_ifindex;
+  //sl.sll_hatype = PACKET_HOST; /* FIXME want 8021q */
   ec = bind(cfg.rx_fd, (struct sockaddr*)&sl, sizeof(sl));
   if (ec < 0) {
     fprintf(stderr,"socket: %s\n", strerror(errno));
@@ -118,16 +142,33 @@ int setup_rx(void) {
     goto done;
   }
 
+  
+  /* enable ancillary data, providing packet length and snaplen, 802.1Q, etc */
+  int on = 1;
+  ec = setsockopt(cfg.rx_fd, SOL_PACKET, PACKET_AUXDATA, &on, sizeof(on));
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt PACKET_AUXDATA: %s\n", strerror(errno));
+    goto done;
+  }
+
   rc = 0;
 
  done:
   return rc;
 }
 
+/*
+ socket(PF_PACKET, SOCK_RAW, 768)        = 3
+ ioctl(3, SIOCGIFINDEX, {ifr_name="tee", ifr_index=7}) = 0
+ bind(3, {sa_family=AF_PACKET, proto=0x03, if7, pkttype=PACKET_HOST, addr(0)={4, }, 20) = 0
+ getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+ ioctl(3, SIOCGIFHWADDR, {ifr_name="tee", ifr_hwaddr=00:0a:cd:2b:0f:b6}) = 0
+ setsockopt(3, SOL_SOCKET, SO_BROADCAST, [1], 4) = 0
+*/
+
 int setup_tx(void) {
   int rc=-1, ec;
 
-  /* any link layer protocol packets (linux/if_ether.h) */
   int protocol = htons(ETH_P_ALL);
 
   /* create the packet socket */
@@ -146,6 +187,27 @@ int setup_tx(void) {
     goto done;
   }
   cfg.odev_ifindex = ifr.ifr_ifindex;
+
+  /* bind interface. doing this to imitate tcpreplay */
+  struct sockaddr_ll sl;
+  memset(&sl, 0, sizeof(sl));
+  sl.sll_family = AF_PACKET;
+  sl.sll_protocol = protocol;
+  sl.sll_hatype = PACKET_HOST; /* using PACKET_HOST like tcpreplay; packet(7) says not needed */
+  sl.sll_ifindex = cfg.odev_ifindex;
+  ec = bind(cfg.tx_fd, (struct sockaddr*)&sl, sizeof(sl));
+  if (ec < 0) {
+    fprintf(stderr,"socket: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* setsockopt SO_BROADCAST like tcpreplay. is this really necessary? */
+  int one = 1;
+  ec = setsockopt(cfg.tx_fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt SO_BROADCAST: %s\n", strerror(errno));
+    goto done;
+  }
 
   rc = 0;
 
@@ -220,9 +282,24 @@ char *inject_vlan(char *tx, ssize_t *nx) {
 int handle_packet(void) {
   int rc=-1;
   ssize_t nr,nt,nx;
-  char *tx = cfg.pkt;
 
-  struct sockaddr_ll addr_r, addr_x;
+  struct tpacket_auxdata *pa; /* for PACKET_AUXDATA; see packet(7) */
+  struct cmsghdr *cmsg;
+  struct {
+    struct cmsghdr h;
+    struct tpacket_auxdata a;
+  } u;
+
+  /* we get the packet and metadata via recvmsg */
+  struct msghdr msgh;
+  memset(&msgh, 0, sizeof(msgh));
+
+  /* ancillary data; we requested packet metadata (PACKET_AUXDATA) */
+  msgh.msg_control = &u;
+  msgh.msg_controllen = sizeof(u);
+
+#if 0
+  struct sockaddr_ll addr_r;
   socklen_t addrlen = sizeof(addr_r);
 
   nr = recvfrom(cfg.rx_fd, cfg.pkt, sizeof(cfg.pkt), 0, 
@@ -231,19 +308,45 @@ int handle_packet(void) {
     fprintf(stderr,"recvfrom: %s\n", nr ? strerror(errno) : "eof");
     goto done;
   }
+#endif
 
-  if (cfg.verbose) fprintf(stderr,"received %lu byte packet\n", (long)nr);
+  struct iovec iov;
+  iov.iov_base = cfg.pkt;
+  iov.iov_len = MAX_PKT;
+  msgh.msg_iov = &iov;
+  msgh.msg_iovlen = 1;
 
-  /* per packet(7) only these five fields should be set on outgoing addr_x */
-  memset(&addr_x, 0, sizeof(addr_x));
-  addr_x.sll_family = AF_PACKET;
-  memcpy(addr_x.sll_addr, cfg.pkt, 6); /* copy dst mac from packet */
-  assert(addr_r.sll_halen == 6);
-  addr_x.sll_halen = addr_r.sll_halen;
-  addr_x.sll_ifindex = cfg.odev_ifindex;
-  addr_x.sll_protocol = addr_r.sll_protocol;
+  nr = recvmsg(cfg.rx_fd, &msgh, 0);
+  if (nr <= 0) {
+    fprintf(stderr,"recvmsg: %s\n", nr ? strerror(errno) : "eof");
+    goto done;
+  }
+
+  if (cfg.verbose) fprintf(stderr,"received %lu bytes of message data\n", (long)nr);
+  if (cfg.verbose) fprintf(stderr,"received %lu bytes of control data\n", (long)msgh.msg_controllen);
+  cmsg = CMSG_FIRSTHDR(&msgh);
+  if (cmsg == NULL) {
+    fprintf(stderr,"ancillary data missing from packet\n");
+    goto done;
+  }
+  pa = (struct tpacket_auxdata*)CMSG_DATA(cmsg);
+  if (cfg.verbose) fprintf(stderr, " packet length  %u\n", pa->tp_len);
+  if (cfg.verbose) fprintf(stderr, " packet snaplen %u\n", pa->tp_snaplen);
+  int losing = (pa->tp_status & TP_STATUS_LOSING) ? 1 : 0; 
+  if (losing) fprintf(stderr, " warning; losing\n");
+  int has_vlan = (pa->tp_status & TP_STATUS_VLAN_VALID) ? 1 : 0; 
+  if (cfg.verbose) fprintf(stderr, " packet has vlan %c\n", has_vlan ? 'Y' : 'N');
+  if (has_vlan) {
+    uint16_t vlan_tci = pa->tp_vlan_tci;
+    //uint16_t tci = ntohs(vlan_tci);
+    uint16_t tci = vlan_tci;
+    uint16_t vid = tci & 0xfff; // vlan VID is in the low 12 bits of the TCI
+    if (cfg.verbose) fprintf(stderr, " packet vlan %d\n", vid);
+    cfg.vlan = vid;
+  }
 
   /* inject 802.1q tag if requested */
+  char *tx = cfg.pkt;
   nx = nr;
   if (cfg.vlan) tx = inject_vlan(tx,&nx);
   if (tx == NULL) {
@@ -257,7 +360,7 @@ int handle_packet(void) {
   /* trim N bytes from frame end if requested. */
   if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
 
-  nt = sendto(cfg.tx_fd, tx, nx, 0, (struct sockaddr*)&addr_x, addrlen);
+  nt = sendto(cfg.tx_fd, tx, nx, 0, NULL, 0);
   if (nt != nx) {
     fprintf(stderr,"sendto: %s\n", (nt < 0) ? strerror(errno) : "partial");
     goto done;

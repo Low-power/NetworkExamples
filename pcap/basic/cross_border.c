@@ -10,35 +10,72 @@
 #include <arpa/inet.h>
 
 
-/* NOTES 
+/* 
+ * decode IP header and test if CIDR border is crossed
  *
- * to test this program's correctness it was compared with the output of
+ * the CIDR defines the "inside" of a subnet.
+ * the crosses_border function tests if the dst or src
+ * IP is inside the cidr and the other one is outside.
  *
- *  tcpdump -ne (to show link level headers and inhibit name resolution)
- * 
- * another useful program is tcprewrite (part of tcpreplay package) which
- * can be used, for example, to insert vlan tags into a pcap, like 
+ * try it:
  *
- *  tcprewrite -i some.pcap -o vlan.pcap --enet-vlan=add --enet-vlan-tag=2210 \
- *              --enet-vlan-pri=0 --enet-vlan-cfi=0
+ * ./cross_border -s 192.168.1.0/24 -r ping.pcap 
  *
+ * loosen cidr:
+ *
+ * ./cross_border -s 192.0.0.0/8 -r ping.pcap 
+ *
+ * tighten cidr:
+ *
+ * ./cross_border -s 192.128.0.0/9 -r ping.pcap
  */
 
-char err[PCAP_ERRBUF_SIZE];
-const int maxsz = 65535;
-int verbose;
+struct cfg {
+  char *prog;
+  char err[PCAP_ERRBUF_SIZE];
+  int maxsz;
+  int verbose;
+  char *border;
+  uint32_t cidr;
+  int slash_n;
+} cfg = {
+  .maxsz =  65535,
+};
 
-void usage(char *prog) {
-  fprintf(stderr,"usage: %s [-v] -i <eth> | -r <file>\n", prog);
+void usage(void) {
+  fprintf(stderr,"usage: %s [-v] [-s cidr] -i <eth> | -r <file>\n", cfg.prog);
   exit(-1);
 }
 
-char m[18];
-char *macf(const uint8_t *mac) {
-  snprintf(m,sizeof(m),"%.2x:%.2x:%.2x:%.2x:%.2x:%.2x", (unsigned)mac[0], 
-       (unsigned)mac[1], (unsigned)mac[2], (unsigned)mac[3], 
-       (unsigned)mac[4], (unsigned)mac[5]);
-  return m;
+/* IP followed by a /N */
+int is_cidr(char *w) {
+  unsigned a, b, c, d, n;
+  int rc = -1, sc;
+
+  sc = sscanf(w, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &n);
+  if (sc != 5) goto done;
+
+  if ((a > 255) || (b > 255) || (c > 255) || (d > 255)) goto done;
+  if (n > 32) goto done;
+
+  cfg.cidr = (a << 24) | (b << 16) | (c << 8) | d;
+  cfg.slash_n = n;
+
+  rc = 0;
+
+ done:
+  return !rc;
+}
+
+/* do the two IPv4 addresses (in host order) differ in their network part? 
+ * if so, is one (but not both) of them "inside" the cidr of interest? */
+int crosses_border(uint32_t a, uint32_t b) {
+  uint64_t m, host_part_nbits;
+
+  host_part_nbits = 32 - cfg.slash_n;
+  m = ~((1UL << host_part_nbits) - 1);
+
+  return (((cfg.cidr & m) == (a & m)) ^ ((cfg.cidr & m) == (b & m))) ? 1 : 0;
 }
 
 /*******************************************************************************
@@ -56,8 +93,6 @@ void cb(u_char *unused, const struct pcap_pkthdr *hdr, const u_char *pkt) {
   const uint8_t *data = pkt+14, *tci_p;
   uint16_t type,tci,vid;
   if (hdr->caplen < 12) return;
-  printf("dst_mac: %s ", macf(dst_mac));
-  printf("src_mac: %s ", macf(src_mac));
  again:
   if (hdr->caplen < ((typep - pkt) + 2)) return;
   memcpy(&type, typep, sizeof(uint16_t)); 
@@ -73,7 +108,6 @@ void cb(u_char *unused, const struct pcap_pkthdr *hdr, const u_char *pkt) {
       else etype = other; 
       break;
   }
-  printf("type: 0x%x (%s) ", (unsigned)type, etypes[etype]);
 
   if (etype==e802) {
     // skip SNAP and LLC header
@@ -91,12 +125,10 @@ void cb(u_char *unused, const struct pcap_pkthdr *hdr, const u_char *pkt) {
     memcpy(&tci, tci_p, sizeof(uint16_t));  
     tci = ntohs(tci);
     vid = tci & 0xfff; // vlan VID is in the low 12 bits of the TCI
-    printf("vlan %d ", vid);
     typep = tci_p + 2;
     goto again; 
   }
   data = typep + 2;
-  printf("\n"); /* end of frame level stuff */
 
   /*****************************************************************************
   * IP datagram 
@@ -129,15 +161,12 @@ void cb(u_char *unused, const struct pcap_pkthdr *hdr, const u_char *pkt) {
     memcpy(&ip_lenh, ip_len, sizeof(uint16_t)); ip_lenh = ntohs(ip_lenh);
     memcpy(&ip_idh, ip_id, sizeof(uint16_t)); ip_idh = ntohs(ip_idh);
     memcpy(&ip_foh, ip_fo, sizeof(uint16_t)); ip_foh = (ntohs(ip_foh) & 0x1fff)*8;
-    printf(" IP vers: %d hdr_len: %d opts_len: %d id: %d off: %d ttl: %d, proto: %d ",
-     (unsigned)ip_version, (unsigned)ip_hdr_len, (unsigned)ip_opts_len, 
-     (unsigned)ip_idh, (unsigned)ip_foh, (unsigned)(*ip_ttl), (unsigned)(*ip_proto));
     switch((unsigned)(*ip_proto)) {
-      case 1: ipproto = icmp; printf("(icmp) "); break;
-      case 2: ipproto = igmp; printf("(igmp) "); break;
-      case 6: ipproto = tcp; printf("(tcp) "); break;
-      case 17: ipproto = udp; printf("(udp) "); break;
-      default: ipproto = none; printf("(none) "); break;
+      case 1: ipproto = icmp;  break;
+      case 2: ipproto = igmp;  break;
+      case 6: ipproto = tcp;  break;
+      case 17: ipproto = udp;  break;
+      default: ipproto = none;  break;
     }
     memcpy(&ip_srch, ip_src, sizeof(uint32_t)); ip_srch = ntohl(ip_srch);
     memcpy(&ip_dsth, ip_dst, sizeof(uint32_t)); ip_dsth = ntohl(ip_dsth);
@@ -150,58 +179,11 @@ void cb(u_char *unused, const struct pcap_pkthdr *hdr, const u_char *pkt) {
                                 (ip_dsth & 0x0000ff00) >>  8,
                                 (ip_dsth & 0x000000ff) >>  0);
     data = ip_data;
+
+    if (crosses_border(ip_srch, ip_dsth)) printf("cross-border ");
+    else printf("not cross-border ");
     printf("\n"); /* end of IP datagram level */
-    if (ip_foh)  {
-      /* if fragmented, TCP/UDP header only in initial fragment */
-      printf("non-initial fragment; headers present on initial fragment only\n");
-      return;
-    }
-
-  /*****************************************************************************
-  * UDP datagram or TCP segment
-   ****************************************************************************/
-
-    const uint8_t *srcpp, *dstpp;
-    uint16_t srcport, dstport;
-    if (ipproto == udp || ipproto == tcp) {
-      srcpp = data;
-      dstpp = data + sizeof(uint16_t);
-      memcpy(&srcport, srcpp, sizeof(uint16_t));
-      memcpy(&dstport, dstpp, sizeof(uint16_t));
-      srcport = ntohs(srcport);
-      dstport = ntohs(dstport);
-      printf("  %s src port: %d dst port: %d ", (ipproto==tcp)?"tcp":"udp",
-       (unsigned)srcport, (unsigned)dstport);
-    }
-    const uint8_t *seqp, *ackp, *hlenp, *flagp, *winp, *optp, *datp;
-    uint8_t hlen, flags;
-    uint32_t seqno, ackno;
-    uint16_t winsz;
-    if (ipproto == tcp) {
-      seqp = data + 2*sizeof(uint16_t);
-      ackp = seqp + sizeof(uint32_t);
-      hlenp = ackp + sizeof(uint32_t);
-      flagp = hlenp + 1;
-      winp = hlenp + sizeof(int16_t);
-      datp = hlenp + 2 * sizeof(uint16_t);
-
-      memcpy(&seqno, seqp, sizeof(uint32_t));
-      seqno = ntohl(seqno);
-      memcpy(&ackno, ackp, sizeof(uint32_t));
-      ackno = ntohl(ackno);
-      hlen = (((*hlenp) & 0xf0) >> 4) * 4;
-      flags = (*flagp) & 0x3f;
-      memcpy(&winsz,winp,sizeof(uint16_t));
-      winsz = ntohs(winsz);
-      printf(" seq %u ack %u hlen: %u win: %u ", seqno, ackno, (unsigned)hlen, 
-       (unsigned)winsz);
-      printf("%c%c%c%c%c%c ", (flags&0x20)?'u':'-', (flags&0x10)?'a':'-', 
-       (flags&0x08)?'p':'-', (flags&0x04)?'r':'-', (flags&0x02)?'s':'-', 
-       (flags&0x01)?'f':'-');
-    }
-    printf("\n"); /* end of transport level */
   }
-
 }
 
 int main(int argc, char *argv[]) {
@@ -209,21 +191,26 @@ int main(int argc, char *argv[]) {
   int opt,rc=-1, lt;
   pcap_t *p=NULL;
 
-  while ( (opt=getopt(argc,argv,"vr:i:h")) != -1) {
+  cfg.prog = argv[0];
+
+  while ( (opt=getopt(argc,argv,"vr:i:hs:")) != -1) {
     switch(opt) {
-      case 'v': verbose++; break;
+      case 'v': cfg.verbose++; break;
       case 'r': file=strdup(optarg); break;
       case 'i': dev=strdup(optarg); break;
-      case 'h': default: usage(argv[0]); break;
+      case 's': cfg.border=strdup(optarg); break;
+      case 'h': default: usage(); break;
     }
   }
 
-  if (file) p = pcap_open_offline(file, err);
-  else if (dev) p = pcap_open_live(dev,maxsz,1,0,err);
-  else usage(argv[0]);
+  if (file) p = pcap_open_offline(file, cfg.err);
+  else if (dev) p = pcap_open_live(dev,cfg.maxsz,1,0,cfg.err);
+  else usage();
+  if (cfg.border == NULL) usage();
+  if (is_cidr(cfg.border) < 0) usage();
 
   if (p == NULL) {
-    fprintf(stderr, "can't open %s: %s\n", dev, err);
+    fprintf(stderr, "can't open %s: %s\n", dev, cfg.err);
     goto done;
   }
 
